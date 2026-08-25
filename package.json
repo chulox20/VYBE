@@ -1,0 +1,27 @@
+{
+  "name": "vybe-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VYBE — Red Social Moderna (React + Express + PostgreSQL + Socket.IO)",
+  "scripts": {
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "test:backend": "cd backend && npm test",
+    "install:all": "npm install --prefix backend && npm install --prefix frontend",
+    "migrate": "cd backend && npm run migrate",
+    "seed": "cd backend && npm run seed"
+  },
+  "keywords": [
+    "social-network",
+    "react",
+    "node",
+    "express",
+    "postgresql",
+    "socketio",
+    "tailwindcss",
+    "framer-motion"
+  ],
+  "author": "Jesús Pérez",
+  "license": "MIT"
+}
