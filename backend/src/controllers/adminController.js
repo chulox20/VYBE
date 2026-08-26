@@ -14,7 +14,7 @@ export class AdminController {
 
   static async getStats(req, res, next) {
     try {
-      const stats = await AdminService.getStats();
+      const stats = await AdminService.getDashboardStats();
       res.json({ success: true, data: stats });
     } catch (error) {
       next(error);
@@ -24,7 +24,7 @@ export class AdminController {
   static async getUsers(req, res, next) {
     try {
       const { status, role, search } = req.query;
-      const users = await AdminService.getUsersList({ status, role, search });
+      const users = await AdminService.listUsers({ status, role, search });
       res.json({ success: true, data: users });
     } catch (error) {
       next(error);
@@ -34,7 +34,7 @@ export class AdminController {
   static async updateUserStatus(req, res, next) {
     try {
       const { status } = req.body;
-      const result = await AdminService.updateUserStatus(req.params.id, status);
+      const result = await AdminService.updateUserStatus(req.params.id, status, req.user.id);
       res.json({ success: true, data: result });
     } catch (error) {
       next(error);
@@ -44,7 +44,7 @@ export class AdminController {
   static async getReports(req, res, next) {
     try {
       const { status } = req.query;
-      const reports = await AdminService.getReportsList({ status });
+      const reports = await AdminService.listReports({ status });
       res.json({ success: true, data: reports });
     } catch (error) {
       next(error);
@@ -54,7 +54,7 @@ export class AdminController {
   static async resolveReport(req, res, next) {
     try {
       const validated = updateReportStatusSchema.parse(req.body);
-      const result = await AdminService.resolveReport(req.params.id, req.user.id, validated);
+      const result = await AdminService.resolveReport(req.params.id, validated, req.user.id);
       res.json({ success: true, data: result });
     } catch (error) {
       next(error);

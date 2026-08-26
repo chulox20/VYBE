@@ -531,6 +531,18 @@ class MemoryStore {
       community,
     };
   }
+
+  // Community populated helper
+  getPopulatedCommunity(communityId) {
+    const comm = this.tables.communities.find(c => c.id === communityId);
+    if (!comm) return null;
+    const owner = this.getPopulatedUser(comm.owner_id);
+    return {
+      ...comm,
+      owner,
+    };
+  }
 }
 
 export const memoryStore = new MemoryStore();
+

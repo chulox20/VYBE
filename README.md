@@ -50,33 +50,33 @@
 
 ## ✨ Características Principales
 
-1. **Feed Personalizado & Algorítmico**:
-   - Pestañas *Para ti*, *Siguiendo* y *Populares*.
+1. **Feed Principal & Filtros Personalizados**:
+   - Pestañas *Para ti* (publicaciones recientes y relevantes de la red), *Siguiendo* (creadores que sigues) y *Populares* (ordenadas por nivel de interacción de likes y comentarios).
    - Paginación basada en cursor (`cursor` / `limit`).
-   - Like animado con confeti y contador en tiempo real.
+   - Like animado con confeti y contador transaccional en tiempo real.
    - Marcadores / Publicaciones guardadas.
    - Compartir enlace rápido con feedback de copiado.
 2. **Comunidades Tecnológicas**:
    - Directorio categorizado (Frontend, Backend & Cloud, AI, Diseño).
    - Crear comunidades públicas con slug único y portada.
-   - Unirse/abandonar comunidades y publicar dentro de ellas.
+   - Unirse/abandonar comunidades de forma atómica y publicar dentro de ellas.
 3. **Mensajería Directa en Tiempo Real**:
-   - Chat bidireccional mediante WebSockets (Socket.IO).
+   - Chat bidireccional mediante WebSockets (Socket.IO) con verificación estricta de membresía en salas.
    - Indicadores de escritura en vivo (*"María está escribiendo..."*).
-   - Confirmación de lectura y envío de imágenes/emojis.
+   - Confirmación de lectura y envío de imágenes rasterizadas (JPG, PNG, WEBP, GIF).
 4. **Notificaciones Push en Vivo**:
    - Notificaciones instantáneas para likes, comentarios, menciones (@username) y nuevos seguidores.
    - Toast flotante interactivo y centro de notificaciones con filtros.
 5. **Comentarios Anidados Jerárquicos**:
    - Hilos de respuestas ilimitadas (`parent_comment_id`).
-   - Menciones clickeables a usuarios.
+   - Recálculo atómico de contadores con eliminación en cascada.
 6. **Explorar & Búsqueda Global**:
-   - Detección de hashtags en tendencia (`#React`, `#Design`, `#AI`).
+   - Detección de hashtags en tendencia basados en publicaciones reales (`#React`, `#Design`, `#AI`).
    - Buscador unificado para usuarios, posts y comunidades con *debounce*.
 7. **Panel de Administración & Moderación**:
    - Métricas y KPIs de la red (Usuarios, Posts, Comunidades, Reportes).
-   - Gestión de usuarios (Activar, Suspender, Bloquear).
-   - Cola de resolución de reportes con acciones disciplinarias automáticas.
+   - Gestión segura de usuarios (con protección para no suspenderse a sí mismo ni al último admin).
+   - Cola de resolución transaccional de reportes.
 
 ---
 
@@ -97,7 +97,7 @@
 ### Prerrequisitos
 - **Node.js**: v18 o superior
 - **npm** o **pnpm**
-- **PostgreSQL** *(opcional: si no está disponible, el sistema activa automáticamente su motor in-memory para desarrollo autónomo sin configuración previa)*.
+- **PostgreSQL** *(opcional: si no está disponible, el sistema activa automáticamente su motor in-memory para desarrollo local autónomo sin configuración previa)*.
 
 ### 1. Clonar el repositorio
 ```bash

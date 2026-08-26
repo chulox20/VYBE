@@ -10,6 +10,11 @@ export const pool = new Pool({
   connectionTimeoutMillis: 3000,
 });
 
+// Crucial: Handle background pool errors to prevent Node from crashing when PG is offline
+pool.on('error', (err) => {
+  // Ignored in dev fallback mode
+});
+
 let isPgConnected = null;
 
 export async function checkPgConnection() {

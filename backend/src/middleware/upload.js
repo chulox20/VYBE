@@ -22,17 +22,21 @@ const storage = multer.diskStorage({
   },
 });
 
+// Strict mime type validation: NEVER allow SVG to avoid script injection/XSS
 const fileFilter = (req, file, cb) => {
-  const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
+  const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
   if (allowedMimeTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error('Tipo de archivo no permitido. Solo se aceptan imágenes (JPG, PNG, WEBP, GIF, SVG).'), false);
+    cb(new Error('Tipo de archivo no permitido. Solo se aceptan imágenes rasterizadas seguras (JPG, PNG, WEBP, GIF).'), false);
   }
 };
 
 export const upload = multer({
   storage: storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+    files: 1,
+  },
   fileFilter: fileFilter,
 });

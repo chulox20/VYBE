@@ -1,36 +1,39 @@
-import { pool, checkPgConnection } from '../db/pool.js';
+import { pool, checkPgConnection, withTransaction } from '../db/pool.js';
 import { memoryStore } from '../db/memoryStore.js';
 import { generateId, slugify } from '../utils/helpers.js';
 
 export class CommunityService {
-  static async getCommunities({ category = null, search = null } = {}) {
+  static async getCommunities(params) {
+    return this.listCommunities(params);
+  }
+
+  static async listCommunities({ category = null, search = null } = {}) {
     const isConnected = await checkPgConnection();
     if (isConnected) {
       let queryText = `
         SELECT c.*,
           json_build_object(
             'id', u.id,
-            'full_name', prof.full_name,
-            'username', prof.username,
-            'avatar_url', prof.avatar_url
+            'full_name', p.full_name,
+            'username', p.username,
+            'avatar_url', p.avatar_url
           ) as owner
         FROM communities c
         JOIN users u ON u.id = c.owner_id
-        JOIN user_profiles prof ON prof.user_id = c.owner_id
+        JOIN user_profiles p ON p.user_id = c.owner_id
         WHERE 1=1
       `;
       const params = [];
       let idx = 1;
 
-      if (category && category !== 'Todos') {
-        queryText += ` AND c.category ILIKE $${idx++}`;
+      if (category && category !== 'all' && category !== 'Todos') {
+        queryText += ` AND LOWER(c.category) = LOWER($${idx++})`;
         params.push(category);
       }
 
       if (search) {
-        queryText += ` AND (c.name ILIKE $${idx} OR c.description ILIKE $${idx})`;
+        queryText += ` AND (LOWER(c.name) LIKE LOWER($${idx}) OR LOWER(c.description) LIKE LOWER($${idx}))`;
         params.push(`%${search}%`);
-        idx++;
       }
 
       queryText += ` ORDER BY c.member_count DESC, c.created_at DESC`;
@@ -38,29 +41,20 @@ export class CommunityService {
       return result.rows;
     } else {
       await memoryStore.init();
-      let list = [...memoryStore.tables.communities];
+      let communities = [...memoryStore.tables.communities];
 
-      if (category && category !== 'Todos') {
-        list = list.filter(c => c.category && c.category.toLowerCase() === category.toLowerCase());
+      if (category && category !== 'all' && category !== 'Todos') {
+        communities = communities.filter(c => c.category?.toLowerCase() === category.toLowerCase());
       }
 
       if (search) {
-        const q = search.toLowerCase();
-        list = list.filter(c => c.name.toLowerCase().includes(q) || (c.description && c.description.toLowerCase().includes(q)));
+        const s = search.toLowerCase();
+        communities = communities.filter(c => c.name.toLowerCase().includes(s) || c.description?.toLowerCase().includes(s));
       }
 
-      return list.map(c => {
-        const owner = memoryStore.getPopulatedUser(c.owner_id);
-        return {
-          ...c,
-          owner: {
-            id: owner?.id,
-            full_name: owner?.full_name,
-            username: owner?.username,
-            avatar_url: owner?.avatar_url,
-          },
-        };
-      });
+      return communities
+        .sort((a, b) => (b.member_count || 0) - (a.member_count || 0))
+        .map(c => memoryStore.getPopulatedCommunity(c.id));
     }
   }
 
@@ -73,15 +67,15 @@ export class CommunityService {
         `SELECT c.*,
           json_build_object(
             'id', u.id,
-            'full_name', prof.full_name,
-            'username', prof.username,
-            'avatar_url', prof.avatar_url
+            'full_name', p.full_name,
+            'username', p.username,
+            'avatar_url', p.avatar_url
           ) as owner,
           EXISTS(SELECT 1 FROM community_members WHERE community_id = c.id AND user_id = $1) as is_member,
-          (SELECT role FROM community_members WHERE community_id = c.id AND user_id = $1 LIMIT 1) as user_role
+          (SELECT role FROM community_members WHERE community_id = c.id AND user_id = $1) as member_role
         FROM communities c
         JOIN users u ON u.id = c.owner_id
-        JOIN user_profiles prof ON prof.user_id = c.owner_id
+        JOIN user_profiles p ON p.user_id = c.owner_id
         WHERE LOWER(c.slug) = $2`,
         [currentUserId, cleanSlug]
       );
@@ -94,104 +88,104 @@ export class CommunityService {
       return result.rows[0];
     } else {
       await memoryStore.init();
-      const community = memoryStore.tables.communities.find(c => c.slug.toLowerCase() === cleanSlug);
-      if (!community) {
+      const comm = memoryStore.tables.communities.find(c => c.slug.toLowerCase() === cleanSlug);
+      if (!comm) {
         const err = new Error('Comunidad no encontrada.');
         err.statusCode = 404;
         throw err;
       }
 
-      const owner = memoryStore.getPopulatedUser(community.owner_id);
-      const membership = currentUserId
-        ? memoryStore.tables.community_members.find(cm => cm.community_id === community.id && cm.user_id === currentUserId)
+      const populated = memoryStore.getPopulatedCommunity(comm.id);
+      const member = currentUserId
+        ? memoryStore.tables.community_members.find(m => m.community_id === comm.id && m.user_id === currentUserId)
         : null;
 
       return {
-        ...community,
-        owner: {
-          id: owner?.id,
-          full_name: owner?.full_name,
-          username: owner?.username,
-          avatar_url: owner?.avatar_url,
-        },
-        is_member: !!membership,
-        user_role: membership ? membership.role : null,
+        ...populated,
+        is_member: !!member,
+        member_role: member ? member.role : null,
       };
     }
   }
 
-  static async createCommunity(userId, { name, slug, description = '', category = 'Tecnología', image_url = '', cover_url = '' }) {
+  static async createCommunity(ownerId, { name, description = '', category = 'General', image_url = null, cover_url = null }) {
     const isConnected = await checkPgConnection();
-    const finalSlug = slug ? slugify(slug) : slugify(name);
     const commId = generateId('comm');
+    let baseSlug = slugify(name);
+    if (!baseSlug) baseSlug = `community-${Date.now()}`;
     const now = new Date().toISOString();
 
-    const defaultImage = image_url || 'https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=300&auto=format&fit=crop&q=80';
-    const defaultCover = cover_url || 'https://images.unsplash.com/photo-1526374965328-7f61d4dc18c5?w=1200&auto=format&fit=crop&q=80';
-
     if (isConnected) {
-      const slugCheck = await pool.query('SELECT id FROM communities WHERE slug = $1', [finalSlug]);
-      if (slugCheck.rows.length > 0) {
-        const err = new Error('Ya existe una comunidad con este nombre o enlace slug.');
-        err.statusCode = 400;
-        throw err;
-      }
+      return await withTransaction(async (client) => {
+        let finalSlug = baseSlug;
+        const checkSlug = await client.query('SELECT 1 FROM communities WHERE slug = $1', [finalSlug]);
+        if (checkSlug.rows.length > 0) {
+          finalSlug = `${baseSlug}-${Math.floor(Math.random() * 900 + 100)}`;
+        }
 
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
         await client.query(
-          `INSERT INTO communities (id, owner_id, name, slug, description, category, image_url, cover_url, member_count)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)`,
-          [commId, userId, name.trim(), finalSlug, description.trim(), category, defaultImage, defaultCover]
+          `INSERT INTO communities (id, name, slug, description, category, image_url, cover_url, owner_id, member_count, post_count)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 0)`,
+          [commId, name, finalSlug, description, category, image_url, cover_url, ownerId]
         );
+
         await client.query(
           `INSERT INTO community_members (id, community_id, user_id, role) VALUES ($1, $2, $3, 'owner')`,
-          [generateId('cm'), commId, userId]
+          [generateId('cm'), commId, ownerId]
         );
-        await client.query('COMMIT');
-      } catch (e) {
-        await client.query('ROLLBACK');
-        throw e;
-      } finally {
-        client.release();
-      }
 
-      return this.getCommunityBySlug(finalSlug, userId);
+        const res = await client.query(
+          `SELECT c.*,
+            json_build_object('id', u.id, 'full_name', p.full_name, 'username', p.username, 'avatar_url', p.avatar_url) as owner,
+            TRUE as is_member,
+            'owner' as member_role
+          FROM communities c
+          JOIN users u ON u.id = c.owner_id
+          JOIN user_profiles p ON p.user_id = c.owner_id
+          WHERE c.id = $1`,
+          [commId]
+        );
+
+        return res.rows[0];
+      });
     } else {
       await memoryStore.init();
-      const existing = memoryStore.tables.communities.find(c => c.slug === finalSlug);
-      if (existing) {
-        const err = new Error('Ya existe una comunidad con este nombre o enlace slug.');
-        err.statusCode = 400;
-        throw err;
+      let finalSlug = baseSlug;
+      if (memoryStore.tables.communities.some(c => c.slug === finalSlug)) {
+        finalSlug = `${baseSlug}-${Math.floor(Math.random() * 900 + 100)}`;
       }
 
-      const newComm = {
+      const newCommunity = {
         id: commId,
-        owner_id: userId,
-        name: name.trim(),
+        name,
         slug: finalSlug,
-        description: description.trim(),
+        description,
         category,
-        image_url: defaultImage,
-        cover_url: defaultCover,
+        image_url,
+        cover_url,
+        owner_id: ownerId,
         member_count: 1,
         post_count: 0,
+        is_private: false,
         created_at: now,
         updated_at: now,
       };
 
-      memoryStore.tables.communities.push(newComm);
+      memoryStore.tables.communities.push(newCommunity);
       memoryStore.tables.community_members.push({
         id: generateId('cm'),
         community_id: commId,
-        user_id: userId,
+        user_id: ownerId,
         role: 'owner',
         joined_at: now,
       });
 
-      return this.getCommunityBySlug(finalSlug, userId);
+      return {
+        ...newCommunity,
+        owner: memoryStore.getPopulatedUser(ownerId),
+        is_member: true,
+        member_role: 'owner',
+      };
     }
   }
 
@@ -200,34 +194,50 @@ export class CommunityService {
     const cleanSlug = slug.toLowerCase().trim();
 
     if (isConnected) {
-      const commCheck = await pool.query('SELECT id, owner_id, member_count FROM communities WHERE LOWER(slug) = $1', [cleanSlug]);
-      if (commCheck.rows.length === 0) {
-        const err = new Error('Comunidad no encontrada.');
-        err.statusCode = 404;
-        throw err;
-      }
-
-      const comm = commCheck.rows[0];
-      const memberCheck = await pool.query('SELECT id, role FROM community_members WHERE community_id = $1 AND user_id = $2', [comm.id, userId]);
-      let isMember = false;
-
-      if (memberCheck.rows.length > 0) {
-        if (memberCheck.rows[0].role === 'owner') {
-          const err = new Error('El creador de la comunidad no puede abandonarla.');
-          err.statusCode = 400;
+      return await withTransaction(async (client) => {
+        const commRes = await client.query('SELECT id, owner_id FROM communities WHERE LOWER(slug) = $1 FOR UPDATE', [cleanSlug]);
+        if (commRes.rows.length === 0) {
+          const err = new Error('Comunidad no encontrada.');
+          err.statusCode = 404;
           throw err;
         }
-        await pool.query('DELETE FROM community_members WHERE community_id = $1 AND user_id = $2', [comm.id, userId]);
-        await pool.query('UPDATE communities SET member_count = GREATEST(1, member_count - 1) WHERE id = $1', [comm.id]);
-        isMember = false;
-      } else {
-        await pool.query('INSERT INTO community_members (id, community_id, user_id, role) VALUES ($1, $2, $3, $4)', [generateId('cm'), comm.id, userId, 'member']);
-        await pool.query('UPDATE communities SET member_count = member_count + 1 WHERE id = $1', [comm.id]);
-        isMember = true;
-      }
 
-      const updated = await pool.query('SELECT member_count FROM communities WHERE id = $1', [comm.id]);
-      return { is_member: isMember, member_count: updated.rows[0].member_count };
+        const { id: communityId, owner_id: ownerId } = commRes.rows[0];
+
+        const memberRes = await client.query(
+          'SELECT id, role FROM community_members WHERE community_id = $1 AND user_id = $2',
+          [communityId, userId]
+        );
+
+        let isMember = false;
+
+        if (memberRes.rows.length > 0) {
+          if (ownerId === userId) {
+            const err = new Error('El creador de la comunidad no puede abandonar su propia comunidad.');
+            err.statusCode = 400;
+            throw err;
+          }
+          await client.query('DELETE FROM community_members WHERE community_id = $1 AND user_id = $2', [communityId, userId]);
+          await client.query(
+            'UPDATE communities SET member_count = (SELECT COUNT(*)::int FROM community_members WHERE community_id = $1) WHERE id = $1',
+            [communityId]
+          );
+          isMember = false;
+        } else {
+          await client.query(
+            'INSERT INTO community_members (id, community_id, user_id, role) VALUES ($1, $2, $3, $4) ON CONFLICT (community_id, user_id) DO NOTHING',
+            [generateId('cm'), communityId, userId, 'member']
+          );
+          await client.query(
+            'UPDATE communities SET member_count = (SELECT COUNT(*)::int FROM community_members WHERE community_id = $1) WHERE id = $1',
+            [communityId]
+          );
+          isMember = true;
+        }
+
+        const countRes = await client.query('SELECT member_count FROM communities WHERE id = $1', [communityId]);
+        return { is_member: isMember, member_count: countRes.rows[0].member_count };
+      });
     } else {
       await memoryStore.init();
       const comm = memoryStore.tables.communities.find(c => c.slug.toLowerCase() === cleanSlug);
@@ -237,17 +247,19 @@ export class CommunityService {
         throw err;
       }
 
-      const memberIdx = memoryStore.tables.community_members.findIndex(cm => cm.community_id === comm.id && cm.user_id === userId);
+      const memberIdx = memoryStore.tables.community_members.findIndex(
+        m => m.community_id === comm.id && m.user_id === userId
+      );
+
       let isMember = false;
 
       if (memberIdx !== -1) {
-        if (memoryStore.tables.community_members[memberIdx].role === 'owner') {
-          const err = new Error('El creador de la comunidad no puede abandonarla.');
+        if (comm.owner_id === userId) {
+          const err = new Error('El creador de la comunidad no puede abandonar su propia comunidad.');
           err.statusCode = 400;
           throw err;
         }
         memoryStore.tables.community_members.splice(memberIdx, 1);
-        comm.member_count = Math.max(1, (comm.member_count || 1) - 1);
         isMember = false;
       } else {
         memoryStore.tables.community_members.push({
@@ -257,11 +269,45 @@ export class CommunityService {
           role: 'member',
           joined_at: new Date().toISOString(),
         });
-        comm.member_count = (comm.member_count || 1) + 1;
         isMember = true;
       }
 
+      comm.member_count = memoryStore.tables.community_members.filter(m => m.community_id === comm.id).length;
       return { is_member: isMember, member_count: comm.member_count };
+    }
+  }
+
+  static async getCommunityMembers(slug) {
+    const isConnected = await checkPgConnection();
+    const cleanSlug = slug.toLowerCase().trim();
+
+    if (isConnected) {
+      const result = await pool.query(
+        `SELECT cm.role, cm.joined_at, u.id, p.full_name, p.username, p.avatar_url, p.bio
+        FROM community_members cm
+        JOIN communities c ON c.id = cm.community_id
+        JOIN users u ON u.id = cm.user_id
+        JOIN user_profiles p ON p.user_id = cm.user_id
+        WHERE LOWER(c.slug) = $1
+        ORDER BY CASE cm.role WHEN 'owner' THEN 1 WHEN 'moderator' THEN 2 ELSE 3 END, cm.joined_at ASC`,
+        [cleanSlug]
+      );
+      return result.rows;
+    } else {
+      await memoryStore.init();
+      const comm = memoryStore.tables.communities.find(c => c.slug.toLowerCase() === cleanSlug);
+      if (!comm) return [];
+
+      return memoryStore.tables.community_members
+        .filter(m => m.community_id === comm.id)
+        .map(m => {
+          const author = memoryStore.getPopulatedUser(m.user_id);
+          return {
+            ...author,
+            role: m.role,
+            joined_at: m.joined_at,
+          };
+        });
     }
   }
 
@@ -283,9 +329,9 @@ export class CommunityService {
           EXISTS(SELECT 1 FROM post_likes WHERE post_id = p.id AND user_id = $1) as is_liked,
           EXISTS(SELECT 1 FROM saved_posts WHERE post_id = p.id AND user_id = $1) as is_saved,
           json_build_object('id', c.id, 'name', c.name, 'slug', c.slug, 'image_url', c.image_url) as community
-        FROM community_posts cp
+        FROM posts p
+        JOIN community_posts cp ON cp.post_id = p.id
         JOIN communities c ON c.id = cp.community_id
-        JOIN posts p ON p.id = cp.post_id
         JOIN users u ON u.id = p.user_id
         JOIN user_profiles prof ON prof.user_id = p.user_id
         WHERE LOWER(c.slug) = $2
@@ -304,47 +350,7 @@ export class CommunityService {
 
       return postIds
         .map(id => memoryStore.getPopulatedPost(id, currentUserId))
-        .filter(Boolean)
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    }
-  }
-
-  static async getCommunityMembers(slug) {
-    const isConnected = await checkPgConnection();
-    const cleanSlug = slug.toLowerCase().trim();
-
-    if (isConnected) {
-      const result = await pool.query(
-        `SELECT cm.role, cm.joined_at,
-          u.id, prof.full_name, prof.username, prof.avatar_url, prof.bio
-        FROM community_members cm
-        JOIN communities c ON c.id = cm.community_id
-        JOIN users u ON u.id = cm.user_id
-        JOIN user_profiles prof ON prof.user_id = u.id
-        WHERE LOWER(c.slug) = $1
-        ORDER BY CASE WHEN cm.role = 'owner' THEN 1 WHEN cm.role = 'moderator' THEN 2 ELSE 3 END, cm.joined_at ASC`,
-        [cleanSlug]
-      );
-      return result.rows;
-    } else {
-      await memoryStore.init();
-      const comm = memoryStore.tables.communities.find(c => c.slug.toLowerCase() === cleanSlug);
-      if (!comm) return [];
-
-      return memoryStore.tables.community_members
-        .filter(cm => cm.community_id === comm.id)
-        .map(cm => {
-          const user = memoryStore.getPopulatedUser(cm.user_id);
-          return {
-            role: cm.role,
-            joined_at: cm.joined_at,
-            id: user.id,
-            full_name: user.full_name,
-            username: user.username,
-            avatar_url: user.avatar_url,
-            bio: user.bio,
-          };
-        });
+        .filter(Boolean);
     }
   }
 }

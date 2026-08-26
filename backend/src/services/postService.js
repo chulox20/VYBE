@@ -1,4 +1,4 @@
-import { pool, checkPgConnection } from '../db/pool.js';
+import { pool, checkPgConnection, withTransaction } from '../db/pool.js';
 import { memoryStore } from '../db/memoryStore.js';
 import { generateId, extractHashtags, extractMentions } from '../utils/helpers.js';
 import { NotificationService } from './notificationService.js';
@@ -10,32 +10,29 @@ export class PostService {
     const now = new Date().toISOString();
 
     if (isConnected) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
+      await withTransaction(async (client) => {
         await client.query(
           `INSERT INTO posts (id, user_id, content, image_url, visibility) VALUES ($1, $2, $3, $4, $5)`,
           [postId, userId, content, image_url, visibility]
         );
-        await client.query(`UPDATE user_profiles SET post_count = post_count + 1 WHERE user_id = $1`, [userId]);
+        await client.query(
+          `UPDATE user_profiles SET post_count = (SELECT COUNT(*)::int FROM posts WHERE user_id = $1) WHERE user_id = $1`,
+          [userId]
+        );
 
         if (community_id) {
           await client.query(
             `INSERT INTO community_posts (id, community_id, post_id) VALUES ($1, $2, $3)`,
             [generateId('cp'), community_id, postId]
           );
-          await client.query(`UPDATE communities SET post_count = post_count + 1 WHERE id = $1`, [community_id]);
+          await client.query(
+            `UPDATE communities SET post_count = (SELECT COUNT(*)::int FROM community_posts WHERE community_id = $1) WHERE id = $1`,
+            [community_id]
+          );
         }
+      });
 
-        await client.query('COMMIT');
-      } catch (e) {
-        await client.query('ROLLBACK');
-        throw e;
-      } finally {
-        client.release();
-      }
-
-      // Check mentions
+      // Mentions notification after transaction commit
       const mentions = extractMentions(content);
       for (const m of mentions) {
         const targetRes = await pool.query('SELECT user_id FROM user_profiles WHERE LOWER(username) = $1', [m.toLowerCase()]);
@@ -68,7 +65,9 @@ export class PostService {
       });
 
       const profile = memoryStore.tables.user_profiles.find(p => p.user_id === userId);
-      if (profile) profile.post_count = (profile.post_count || 0) + 1;
+      if (profile) {
+        profile.post_count = memoryStore.tables.posts.filter(p => p.user_id === userId).length;
+      }
 
       if (community_id) {
         memoryStore.tables.community_posts.push({
@@ -78,10 +77,11 @@ export class PostService {
           created_at: now,
         });
         const comm = memoryStore.tables.communities.find(c => c.id === community_id);
-        if (comm) comm.post_count = (comm.post_count || 0) + 1;
+        if (comm) {
+          comm.post_count = memoryStore.tables.community_posts.filter(cp => cp.community_id === community_id).length;
+        }
       }
 
-      // Mentions in memory
       const mentions = extractMentions(content);
       for (const m of mentions) {
         const targetProfile = memoryStore.tables.user_profiles.find(p => p.username.toLowerCase() === m.toLowerCase());
@@ -102,7 +102,7 @@ export class PostService {
 
   static async getFeed(currentUserId = null, { limit = 20, cursor = null, tab = 'for_you' } = {}) {
     const isConnected = await checkPgConnection();
-    const parsedLimit = Math.min(Math.max(parseInt(limit) || 20, 1), 50);
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
     if (isConnected) {
       let queryText = `
@@ -238,22 +238,43 @@ export class PostService {
   static async deletePost(postId, userId, isAdmin = false) {
     const isConnected = await checkPgConnection();
     if (isConnected) {
-      const check = await pool.query('SELECT user_id FROM posts WHERE id = $1', [postId]);
-      if (check.rows.length === 0) {
-        const err = new Error('Publicación no encontrada.');
-        err.statusCode = 404;
-        throw err;
-      }
+      return await withTransaction(async (client) => {
+        const check = await client.query('SELECT user_id FROM posts WHERE id = $1', [postId]);
+        if (check.rows.length === 0) {
+          const err = new Error('Publicación no encontrada.');
+          err.statusCode = 404;
+          throw err;
+        }
 
-      if (check.rows[0].user_id !== userId && !isAdmin) {
-        const err = new Error('No tienes permiso para eliminar esta publicación.');
-        err.statusCode = 403;
-        throw err;
-      }
+        const authorId = check.rows[0].user_id;
+        if (authorId !== userId && !isAdmin) {
+          const err = new Error('No tienes permiso para eliminar esta publicación.');
+          err.statusCode = 403;
+          throw err;
+        }
 
-      await pool.query('DELETE FROM posts WHERE id = $1', [postId]);
-      await pool.query('UPDATE user_profiles SET post_count = GREATEST(0, post_count - 1) WHERE user_id = $1', [check.rows[0].user_id]);
-      return { success: true, message: 'Publicación eliminada correctamente.' };
+        // Get linked communities before deletion
+        const commPosts = await client.query('SELECT community_id FROM community_posts WHERE post_id = $1', [postId]);
+
+        // Delete post
+        await client.query('DELETE FROM posts WHERE id = $1', [postId]);
+
+        // Recalculate user post count
+        await client.query(
+          'UPDATE user_profiles SET post_count = (SELECT COUNT(*)::int FROM posts WHERE user_id = $1) WHERE user_id = $1',
+          [authorId]
+        );
+
+        // Recalculate community post count if post belonged to communities
+        for (const row of commPosts.rows) {
+          await client.query(
+            'UPDATE communities SET post_count = (SELECT COUNT(*)::int FROM community_posts WHERE community_id = $1) WHERE id = $1',
+            [row.community_id]
+          );
+        }
+
+        return { success: true, message: 'Publicación eliminada correctamente.' };
+      });
     } else {
       await memoryStore.init();
       const idx = memoryStore.tables.posts.findIndex(p => p.id === postId);
@@ -270,9 +291,37 @@ export class PostService {
         throw err;
       }
 
+      // Check community links
+      const commPostIdxs = [];
+      const affectedCommunityIds = [];
+      memoryStore.tables.community_posts.forEach((cp, cpIdx) => {
+        if (cp.post_id === postId) {
+          commPostIdxs.push(cpIdx);
+          affectedCommunityIds.push(cp.community_id);
+        }
+      });
+
+      // Remove in reverse order
+      for (let i = commPostIdxs.length - 1; i >= 0; i--) {
+        memoryStore.tables.community_posts.splice(commPostIdxs[i], 1);
+      }
+
+      // Remove post
       memoryStore.tables.posts.splice(idx, 1);
+
+      // Recalculate user post count
       const profile = memoryStore.tables.user_profiles.find(p => p.user_id === post.user_id);
-      if (profile) profile.post_count = Math.max(0, (profile.post_count || 0) - 1);
+      if (profile) {
+        profile.post_count = memoryStore.tables.posts.filter(p => p.user_id === post.user_id).length;
+      }
+
+      // Recalculate community post count
+      for (const commId of affectedCommunityIds) {
+        const comm = memoryStore.tables.communities.find(c => c.id === commId);
+        if (comm) {
+          comm.post_count = memoryStore.tables.community_posts.filter(cp => cp.community_id === commId).length;
+        }
+      }
 
       return { success: true, message: 'Publicación eliminada correctamente.' };
     }
@@ -281,38 +330,56 @@ export class PostService {
   static async toggleLike(postId, userId) {
     const isConnected = await checkPgConnection();
     if (isConnected) {
-      const postCheck = await pool.query('SELECT user_id, like_count FROM posts WHERE id = $1', [postId]);
-      if (postCheck.rows.length === 0) {
-        const err = new Error('Publicación no encontrada.');
-        err.statusCode = 404;
-        throw err;
-      }
-
-      const existingLike = await pool.query('SELECT id FROM post_likes WHERE user_id = $1 AND post_id = $2', [userId, postId]);
-      let isLiked = false;
-
-      if (existingLike.rows.length > 0) {
-        await pool.query('DELETE FROM post_likes WHERE user_id = $1 AND post_id = $2', [userId, postId]);
-        await pool.query('UPDATE posts SET like_count = GREATEST(0, like_count - 1) WHERE id = $1', [postId]);
-        isLiked = false;
-      } else {
-        await pool.query('INSERT INTO post_likes (id, user_id, post_id) VALUES ($1, $2, $3)', [generateId('pl'), userId, postId]);
-        await pool.query('UPDATE posts SET like_count = like_count + 1 WHERE id = $1', [postId]);
-        isLiked = true;
-
-        if (postCheck.rows[0].user_id !== userId) {
-          await NotificationService.createNotification({
-            userId: postCheck.rows[0].user_id,
-            actorId: userId,
-            type: 'like',
-            postId,
-            message: 'le dio like a tu publicación',
-          });
+      const result = await withTransaction(async (client) => {
+        const postCheck = await client.query('SELECT user_id FROM posts WHERE id = $1 FOR UPDATE', [postId]);
+        if (postCheck.rows.length === 0) {
+          const err = new Error('Publicación no encontrada.');
+          err.statusCode = 404;
+          throw err;
         }
+
+        const authorId = postCheck.rows[0].user_id;
+        const existingLike = await client.query(
+          'SELECT id FROM post_likes WHERE user_id = $1 AND post_id = $2',
+          [userId, postId]
+        );
+
+        let isLiked = false;
+
+        if (existingLike.rows.length > 0) {
+          await client.query('DELETE FROM post_likes WHERE user_id = $1 AND post_id = $2', [userId, postId]);
+          await client.query(
+            'UPDATE posts SET like_count = (SELECT COUNT(*)::int FROM post_likes WHERE post_id = $1) WHERE id = $1',
+            [postId]
+          );
+          isLiked = false;
+        } else {
+          await client.query(
+            'INSERT INTO post_likes (id, user_id, post_id) VALUES ($1, $2, $3) ON CONFLICT (user_id, post_id) DO NOTHING',
+            [generateId('pl'), userId, postId]
+          );
+          await client.query(
+            'UPDATE posts SET like_count = (SELECT COUNT(*)::int FROM post_likes WHERE post_id = $1) WHERE id = $1',
+            [postId]
+          );
+          isLiked = true;
+        }
+
+        const countRes = await client.query('SELECT like_count FROM posts WHERE id = $1', [postId]);
+        return { isLiked, likeCount: countRes.rows[0].like_count, authorId };
+      });
+
+      if (result.isLiked && result.authorId !== userId) {
+        await NotificationService.createNotification({
+          userId: result.authorId,
+          actorId: userId,
+          type: 'like',
+          postId,
+          message: 'le dio like a tu publicación',
+        });
       }
 
-      const updated = await pool.query('SELECT like_count FROM posts WHERE id = $1', [postId]);
-      return { is_liked: isLiked, like_count: updated.rows[0].like_count };
+      return { is_liked: result.isLiked, like_count: result.likeCount };
     } else {
       await memoryStore.init();
       const post = memoryStore.tables.posts.find(p => p.id === postId);
@@ -327,7 +394,6 @@ export class PostService {
 
       if (likeIdx !== -1) {
         memoryStore.tables.post_likes.splice(likeIdx, 1);
-        post.like_count = Math.max(0, (post.like_count || 0) - 1);
         isLiked = false;
       } else {
         memoryStore.tables.post_likes.push({
@@ -336,18 +402,20 @@ export class PostService {
           post_id: postId,
           created_at: new Date().toISOString(),
         });
-        post.like_count = (post.like_count || 0) + 1;
         isLiked = true;
+      }
 
-        if (post.user_id !== userId) {
-          await NotificationService.createNotification({
-            userId: post.user_id,
-            actorId: userId,
-            type: 'like',
-            postId,
-            message: 'le dio like a tu publicación',
-          });
-        }
+      // Recalculate count accurately
+      post.like_count = memoryStore.tables.post_likes.filter(l => l.post_id === postId).length;
+
+      if (isLiked && post.user_id !== userId) {
+        await NotificationService.createNotification({
+          userId: post.user_id,
+          actorId: userId,
+          type: 'like',
+          postId,
+          message: 'le dio like a tu publicación',
+        });
       }
 
       return { is_liked: isLiked, like_count: post.like_count };
@@ -357,27 +425,41 @@ export class PostService {
   static async toggleSave(postId, userId) {
     const isConnected = await checkPgConnection();
     if (isConnected) {
-      const postCheck = await pool.query('SELECT id FROM posts WHERE id = $1', [postId]);
-      if (postCheck.rows.length === 0) {
-        const err = new Error('Publicación no encontrada.');
-        err.statusCode = 404;
-        throw err;
-      }
+      return await withTransaction(async (client) => {
+        const postCheck = await client.query('SELECT id FROM posts WHERE id = $1', [postId]);
+        if (postCheck.rows.length === 0) {
+          const err = new Error('Publicación no encontrada.');
+          err.statusCode = 404;
+          throw err;
+        }
 
-      const existingSave = await pool.query('SELECT id FROM saved_posts WHERE user_id = $1 AND post_id = $2', [userId, postId]);
-      let isSaved = false;
+        const existingSave = await client.query(
+          'SELECT id FROM saved_posts WHERE user_id = $1 AND post_id = $2',
+          [userId, postId]
+        );
+        let isSaved = false;
 
-      if (existingSave.rows.length > 0) {
-        await pool.query('DELETE FROM saved_posts WHERE user_id = $1 AND post_id = $2', [userId, postId]);
-        await pool.query('UPDATE posts SET bookmark_count = GREATEST(0, bookmark_count - 1) WHERE id = $1', [postId]);
-        isSaved = false;
-      } else {
-        await pool.query('INSERT INTO saved_posts (id, user_id, post_id) VALUES ($1, $2, $3)', [generateId('sp'), userId, postId]);
-        await pool.query('UPDATE posts SET bookmark_count = bookmark_count + 1 WHERE id = $1', [postId]);
-        isSaved = true;
-      }
+        if (existingSave.rows.length > 0) {
+          await client.query('DELETE FROM saved_posts WHERE user_id = $1 AND post_id = $2', [userId, postId]);
+          await client.query(
+            'UPDATE posts SET bookmark_count = (SELECT COUNT(*)::int FROM saved_posts WHERE post_id = $1) WHERE id = $1',
+            [postId]
+          );
+          isSaved = false;
+        } else {
+          await client.query(
+            'INSERT INTO saved_posts (id, user_id, post_id) VALUES ($1, $2, $3) ON CONFLICT (user_id, post_id) DO NOTHING',
+            [generateId('sp'), userId, postId]
+          );
+          await client.query(
+            'UPDATE posts SET bookmark_count = (SELECT COUNT(*)::int FROM saved_posts WHERE post_id = $1) WHERE id = $1',
+            [postId]
+          );
+          isSaved = true;
+        }
 
-      return { is_saved: isSaved };
+        return { is_saved: isSaved };
+      });
     } else {
       await memoryStore.init();
       const post = memoryStore.tables.posts.find(p => p.id === postId);
@@ -392,7 +474,6 @@ export class PostService {
 
       if (saveIdx !== -1) {
         memoryStore.tables.saved_posts.splice(saveIdx, 1);
-        post.bookmark_count = Math.max(0, (post.bookmark_count || 0) - 1);
         isSaved = false;
       } else {
         memoryStore.tables.saved_posts.push({
@@ -401,10 +482,10 @@ export class PostService {
           post_id: postId,
           created_at: new Date().toISOString(),
         });
-        post.bookmark_count = (post.bookmark_count || 0) + 1;
         isSaved = true;
       }
 
+      post.bookmark_count = memoryStore.tables.saved_posts.filter(s => s.post_id === postId).length;
       return { is_saved: isSaved };
     }
   }

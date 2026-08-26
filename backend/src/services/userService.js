@@ -1,4 +1,4 @@
-import { pool, checkPgConnection } from '../db/pool.js';
+import { pool, checkPgConnection, withTransaction } from '../db/pool.js';
 import { memoryStore } from '../db/memoryStore.js';
 import { generateId } from '../utils/helpers.js';
 import { NotificationService } from './notificationService.js';
@@ -71,22 +71,50 @@ export class UserService {
         throw err;
       }
 
-      const existingFollow = await pool.query('SELECT id FROM follows WHERE follower_id = $1 AND following_id = $2', [followerId, targetId]);
-      let isFollowing = false;
+      // Execute ACID Transaction for follow insertion/deletion and counter updates
+      const result = await withTransaction(async (client) => {
+        const existingFollow = await client.query(
+          'SELECT id FROM follows WHERE follower_id = $1 AND following_id = $2 FOR UPDATE',
+          [followerId, targetId]
+        );
 
-      if (existingFollow.rows.length > 0) {
-        await pool.query('DELETE FROM follows WHERE follower_id = $1 AND following_id = $2', [followerId, targetId]);
-        await pool.query('UPDATE user_profiles SET follower_count = GREATEST(0, follower_count - 1) WHERE user_id = $1', [targetId]);
-        await pool.query('UPDATE user_profiles SET following_count = GREATEST(0, following_count - 1) WHERE user_id = $1', [followerId]);
-        isFollowing = false;
-      } else {
-        await pool.query('INSERT INTO follows (id, follower_id, following_id) VALUES ($1, $2, $3)', [generateId('flw'), followerId, targetId]);
-        await pool.query('UPDATE user_profiles SET follower_count = follower_count + 1 WHERE user_id = $1', [targetId]);
-        await pool.query('UPDATE user_profiles SET following_count = following_count + 1 WHERE user_id = $1', [followerId]);
-        isFollowing = true;
+        let isFollowing = false;
 
+        if (existingFollow.rows.length > 0) {
+          await client.query('DELETE FROM follows WHERE follower_id = $1 AND following_id = $2', [followerId, targetId]);
+          await client.query(
+            'UPDATE user_profiles SET follower_count = (SELECT COUNT(*)::int FROM follows WHERE following_id = $1) WHERE user_id = $1',
+            [targetId]
+          );
+          await client.query(
+            'UPDATE user_profiles SET following_count = (SELECT COUNT(*)::int FROM follows WHERE follower_id = $1) WHERE user_id = $1',
+            [followerId]
+          );
+          isFollowing = false;
+        } else {
+          await client.query(
+            'INSERT INTO follows (id, follower_id, following_id) VALUES ($1, $2, $3)',
+            [generateId('flw'), followerId, targetId]
+          );
+          await client.query(
+            'UPDATE user_profiles SET follower_count = (SELECT COUNT(*)::int FROM follows WHERE following_id = $1) WHERE user_id = $1',
+            [targetId]
+          );
+          await client.query(
+            'UPDATE user_profiles SET following_count = (SELECT COUNT(*)::int FROM follows WHERE follower_id = $1) WHERE user_id = $1',
+            [followerId]
+          );
+          isFollowing = true;
+        }
+
+        const countRes = await client.query('SELECT follower_count FROM user_profiles WHERE user_id = $1', [targetId]);
+        return { isFollowing, followerCount: countRes.rows[0].follower_count, targetId };
+      });
+
+      // Notification is dispatched after successful transaction commit
+      if (result.isFollowing) {
         await NotificationService.createNotification({
-          userId: targetId,
+          userId: result.targetId,
           actorId: followerId,
           type: 'follow',
           postId: null,
@@ -94,8 +122,7 @@ export class UserService {
         });
       }
 
-      const updatedProfile = await pool.query('SELECT follower_count, following_count FROM user_profiles WHERE user_id = $1', [targetId]);
-      return { is_following: isFollowing, follower_count: updatedProfile.rows[0].follower_count };
+      return { is_following: result.isFollowing, follower_count: result.followerCount };
     } else {
       await memoryStore.init();
       const targetProfile = memoryStore.tables.user_profiles.find(p => p.username.toLowerCase() === cleanUsername);
@@ -118,8 +145,6 @@ export class UserService {
 
       if (followIdx !== -1) {
         memoryStore.tables.follows.splice(followIdx, 1);
-        targetProfile.follower_count = Math.max(0, (targetProfile.follower_count || 0) - 1);
-        if (followerProfile) followerProfile.following_count = Math.max(0, (followerProfile.following_count || 0) - 1);
         isFollowing = false;
       } else {
         memoryStore.tables.follows.push({
@@ -128,10 +153,16 @@ export class UserService {
           following_id: targetId,
           created_at: new Date().toISOString(),
         });
-        targetProfile.follower_count = (targetProfile.follower_count || 0) + 1;
-        if (followerProfile) followerProfile.following_count = (followerProfile.following_count || 0) + 1;
         isFollowing = true;
+      }
 
+      // Recalculate derived counters atomically
+      targetProfile.follower_count = memoryStore.tables.follows.filter(f => f.following_id === targetId).length;
+      if (followerProfile) {
+        followerProfile.following_count = memoryStore.tables.follows.filter(f => f.follower_id === followerId).length;
+      }
+
+      if (isFollowing) {
         await NotificationService.createNotification({
           userId: targetId,
           actorId: followerId,

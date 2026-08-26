@@ -1,4 +1,4 @@
-import { pool, checkPgConnection } from '../db/pool.js';
+import { pool, checkPgConnection, withTransaction } from '../db/pool.js';
 import { memoryStore } from '../db/memoryStore.js';
 import { generateId, extractMentions } from '../utils/helpers.js';
 import { NotificationService } from './notificationService.js';
@@ -10,23 +10,42 @@ export class CommentService {
     const now = new Date().toISOString();
 
     if (isConnected) {
-      const postCheck = await pool.query('SELECT user_id FROM posts WHERE id = $1', [postId]);
-      if (postCheck.rows.length === 0) {
-        const err = new Error('Publicación no encontrada.');
-        err.statusCode = 404;
-        throw err;
-      }
+      const { postAuthorId, parentAuthorId } = await withTransaction(async (client) => {
+        const postCheck = await client.query('SELECT user_id FROM posts WHERE id = $1 FOR UPDATE', [postId]);
+        if (postCheck.rows.length === 0) {
+          const err = new Error('Publicación no encontrada.');
+          err.statusCode = 404;
+          throw err;
+        }
 
-      await pool.query(
-        `INSERT INTO comments (id, post_id, user_id, parent_comment_id, content) VALUES ($1, $2, $3, $4, $5)`,
-        [commentId, postId, userId, parent_comment_id, content]
-      );
-      await pool.query(`UPDATE posts SET comment_count = comment_count + 1 WHERE id = $1`, [postId]);
+        const pAuthorId = postCheck.rows[0].user_id;
+        let pCommentAuthorId = null;
+
+        if (parent_comment_id) {
+          const parentCheck = await client.query('SELECT user_id FROM comments WHERE id = $1', [parent_comment_id]);
+          if (parentCheck.rows.length > 0) {
+            pCommentAuthorId = parentCheck.rows[0].user_id;
+          }
+        }
+
+        await client.query(
+          `INSERT INTO comments (id, post_id, user_id, parent_comment_id, content) VALUES ($1, $2, $3, $4, $5)`,
+          [commentId, postId, userId, parent_comment_id, content]
+        );
+
+        // Recalculate post comment_count accurately
+        await client.query(
+          `UPDATE posts SET comment_count = (SELECT COUNT(*)::int FROM comments WHERE post_id = $1) WHERE id = $1`,
+          [postId]
+        );
+
+        return { postAuthorId: pAuthorId, parentAuthorId: pCommentAuthorId };
+      });
 
       // Notify post author
-      if (postCheck.rows[0].user_id !== userId) {
+      if (postAuthorId && postAuthorId !== userId) {
         await NotificationService.createNotification({
-          userId: postCheck.rows[0].user_id,
+          userId: postAuthorId,
           actorId: userId,
           type: 'comment',
           postId,
@@ -35,17 +54,14 @@ export class CommentService {
       }
 
       // If parent comment, notify parent author
-      if (parent_comment_id) {
-        const parentCheck = await pool.query('SELECT user_id FROM comments WHERE id = $1', [parent_comment_id]);
-        if (parentCheck.rows.length > 0 && parentCheck.rows[0].user_id !== userId && parentCheck.rows[0].user_id !== postCheck.rows[0].user_id) {
-          await NotificationService.createNotification({
-            userId: parentCheck.rows[0].user_id,
-            actorId: userId,
-            type: 'comment',
-            postId,
-            message: `respondió a tu comentario: "${content.slice(0, 50)}..."`,
-          });
-        }
+      if (parentAuthorId && parentAuthorId !== userId && parentAuthorId !== postAuthorId) {
+        await NotificationService.createNotification({
+          userId: parentAuthorId,
+          actorId: userId,
+          type: 'comment',
+          postId,
+          message: `respondió a tu comentario: "${content.slice(0, 50)}..."`,
+        });
       }
 
       const res = await pool.query(
@@ -85,7 +101,7 @@ export class CommentService {
       };
 
       memoryStore.tables.comments.push(newComment);
-      post.comment_count = (post.comment_count || 0) + 1;
+      post.comment_count = memoryStore.tables.comments.filter(c => c.post_id === postId).length;
 
       // Notify post author
       if (post.user_id !== userId) {
@@ -192,22 +208,33 @@ export class CommentService {
   static async deleteComment(commentId, userId, isAdmin = false) {
     const isConnected = await checkPgConnection();
     if (isConnected) {
-      const check = await pool.query('SELECT post_id, user_id FROM comments WHERE id = $1', [commentId]);
-      if (check.rows.length === 0) {
-        const err = new Error('Comentario no encontrado.');
-        err.statusCode = 404;
-        throw err;
-      }
+      return await withTransaction(async (client) => {
+        const check = await client.query('SELECT post_id, user_id FROM comments WHERE id = $1 FOR UPDATE', [commentId]);
+        if (check.rows.length === 0) {
+          const err = new Error('Comentario no encontrado.');
+          err.statusCode = 404;
+          throw err;
+        }
 
-      if (check.rows[0].user_id !== userId && !isAdmin) {
-        const err = new Error('No tienes permiso para eliminar este comentario.');
-        err.statusCode = 403;
-        throw err;
-      }
+        const { post_id, user_id: commentAuthorId } = check.rows[0];
 
-      await pool.query('DELETE FROM comments WHERE id = $1', [commentId]);
-      await pool.query('UPDATE posts SET comment_count = GREATEST(0, comment_count - 1) WHERE id = $1', [check.rows[0].post_id]);
-      return { success: true, message: 'Comentario eliminado correctamente.' };
+        if (commentAuthorId !== userId && !isAdmin) {
+          const err = new Error('No tienes permiso para eliminar este comentario.');
+          err.statusCode = 403;
+          throw err;
+        }
+
+        // Delete comment (PostgreSQL cascades child replies via ON DELETE CASCADE)
+        await client.query('DELETE FROM comments WHERE id = $1', [commentId]);
+
+        // Recalculate the entire comment_count for the post accurately to account for cascaded children
+        await client.query(
+          'UPDATE posts SET comment_count = (SELECT COUNT(*)::int FROM comments WHERE post_id = $1) WHERE id = $1',
+          [post_id]
+        );
+
+        return { success: true, message: 'Comentario eliminado correctamente.' };
+      });
     } else {
       await memoryStore.init();
       const idx = memoryStore.tables.comments.findIndex(c => c.id === commentId);
@@ -224,9 +251,25 @@ export class CommentService {
         throw err;
       }
 
-      memoryStore.tables.comments.splice(idx, 1);
-      const post = memoryStore.tables.posts.find(p => p.id === comment.post_id);
-      if (post) post.comment_count = Math.max(0, (post.comment_count || 0) - 1);
+      const postId = comment.post_id;
+
+      // Recursively gather all descendant comment IDs
+      const getAllChildIds = (parentId) => {
+        const directChildren = memoryStore.tables.comments.filter(c => c.parent_comment_id === parentId);
+        let ids = directChildren.map(c => c.id);
+        for (const child of directChildren) {
+          ids = ids.concat(getAllChildIds(child.id));
+        }
+        return ids;
+      };
+
+      const idsToDelete = new Set([commentId, ...getAllChildIds(commentId)]);
+      memoryStore.tables.comments = memoryStore.tables.comments.filter(c => !idsToDelete.has(c.id));
+
+      const post = memoryStore.tables.posts.find(p => p.id === postId);
+      if (post) {
+        post.comment_count = memoryStore.tables.comments.filter(c => c.post_id === postId).length;
+      }
 
       return { success: true, message: 'Comentario eliminado correctamente.' };
     }
