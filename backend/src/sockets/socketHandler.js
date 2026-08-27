@@ -23,11 +23,11 @@ async function isUserMemberOfConversation(conversationId, userId) {
 export function initializeSockets(io) {
   const onlineUsers = new Map(); // userId -> socketId set
 
-  // JWT Middleware for Socket.io
+  // JWT Middleware for Socket.io (Strictly via handshake auth, never in query string)
   io.use((socket, next) => {
-    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+    const token = socket.handshake.auth?.token;
     if (!token) {
-      return next(new Error('Authentication error: Token required'));
+      return next(new Error('Authentication error: Token required in auth payload'));
     }
 
     try {

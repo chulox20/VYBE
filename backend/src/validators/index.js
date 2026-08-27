@@ -56,11 +56,12 @@ export const createReportSchema = z.object({
   target_type: z.enum(['post', 'comment', 'user']),
   target_id: z.string().min(1),
   reason: z.string().min(3, 'Debe especificar el motivo del reporte').max(255),
-  notes: z.string().max(500).optional(),
+  details: z.string().max(500).optional().default(''),
 });
 
 export const updateReportStatusSchema = z.object({
-  status: z.enum(['pending', 'reviewed', 'resolved', 'dismissed']),
-  notes: z.string().max(500).optional(),
+  status: z.enum(['pending', 'reviewed', 'resolved', 'dismissed']).default('resolved'),
   action: z.enum(['none', 'delete_content', 'suspend_user', 'ban_user']).default('none'),
+  details: z.string().max(500).optional().default(''),
 });
+

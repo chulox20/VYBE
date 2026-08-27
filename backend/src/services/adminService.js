@@ -240,7 +240,7 @@ export class AdminService {
 
         await client.query(
           `UPDATE reports
-           SET status = 'resolved', action_taken = $1, reviewed_by = $2, reviewed_at = NOW()
+           SET status = 'resolved', action_taken = $1, resolved_by = $2, resolved_at = NOW()
            WHERE id = $3`,
           [action, currentAdminId, reportId]
         );
@@ -268,8 +268,8 @@ export class AdminService {
 
       report.status = 'resolved';
       report.action_taken = action;
-      report.reviewed_by = currentAdminId;
-      report.reviewed_at = new Date().toISOString();
+      report.resolved_by = currentAdminId;
+      report.resolved_at = new Date().toISOString();
 
       return { success: true, message: 'Reporte resuelto con éxito.' };
     }

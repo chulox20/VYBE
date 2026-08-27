@@ -190,8 +190,10 @@ CREATE TABLE reports (
   target_type VARCHAR(32) NOT NULL CHECK (target_type IN ('post', 'comment', 'user')),
   target_id VARCHAR(64) NOT NULL,
   reason VARCHAR(255) NOT NULL,
-  status VARCHAR(32) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'reviewed', 'resolved', 'dismissed')),
-  notes TEXT DEFAULT '',
+  details TEXT DEFAULT '',
+  status VARCHAR(32) NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'reviewed', 'resolved', 'dismissed')),
+  action_taken VARCHAR(64) DEFAULT NULL,
   resolved_by VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
   resolved_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
