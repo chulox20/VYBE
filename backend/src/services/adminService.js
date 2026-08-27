@@ -130,7 +130,7 @@ export class AdminService {
     }
   }
 
-  static async updateUserStatus(targetUserId, newStatus, currentAdminId) {
+  static async updateUserStatus(targetUserId, newStatus, currentAdminId, client = null) {
     // Protection: Admin cannot suspend or ban themselves
     if (targetUserId === currentAdminId && (newStatus === 'suspended' || newStatus === 'banned')) {
       const err = new Error('No puedes suspender ni bloquear tu propia cuenta de administrador.');
@@ -140,8 +140,8 @@ export class AdminService {
 
     const isConnected = await checkPgConnection();
     if (isConnected) {
-      return await withTransaction(async (client) => {
-        const targetRes = await client.query('SELECT role, status FROM users WHERE id = $1 FOR UPDATE', [targetUserId]);
+      const executeUpdate = async (txClient) => {
+        const targetRes = await txClient.query('SELECT role, status FROM users WHERE id = $1 FOR UPDATE', [targetUserId]);
         if (targetRes.rows.length === 0) {
           const err = new Error('Usuario no encontrado.');
           err.statusCode = 404;
@@ -152,7 +152,7 @@ export class AdminService {
 
         // Protection: Ensure at least one active admin remains in the system
         if (targetUser.role === 'admin' && (newStatus === 'suspended' || newStatus === 'banned')) {
-          const adminCountRes = await client.query("SELECT COUNT(*)::int as count FROM users WHERE role = 'admin' AND status = 'active' AND id != $1", [targetUserId]);
+          const adminCountRes = await txClient.query("SELECT COUNT(*)::int as count FROM users WHERE role = 'admin' AND status = 'active' AND id != $1", [targetUserId]);
           if (adminCountRes.rows[0].count === 0) {
             const err = new Error('No se puede desactivar al único administrador activo del sistema.');
             err.statusCode = 400;
@@ -160,9 +160,14 @@ export class AdminService {
           }
         }
 
-        await client.query('UPDATE users SET status = $1 WHERE id = $2', [newStatus, targetUserId]);
+        await txClient.query('UPDATE users SET status = $1 WHERE id = $2', [newStatus, targetUserId]);
         return { success: true, message: `Estado de usuario actualizado a ${newStatus}.` };
-      });
+      };
+
+      if (client) {
+        return await executeUpdate(client);
+      }
+      return await withTransaction(executeUpdate);
     } else {
       await memoryStore.init();
       const user = memoryStore.tables.users.find(u => u.id === targetUserId);
@@ -228,14 +233,15 @@ export class AdminService {
 
         const report = reportRes.rows[0];
 
+        // Execute action passing the same atomic transaction client
         if (action === 'delete_content') {
           if (report.target_type === 'post') {
-            await PostService.deletePost(report.target_id, currentAdminId, true);
+            await PostService.deletePost(report.target_id, currentAdminId, true, client);
           } else if (report.target_type === 'comment') {
-            await CommentService.deleteComment(report.target_id, currentAdminId, true);
+            await CommentService.deleteComment(report.target_id, currentAdminId, true, client);
           }
         } else if (action === 'suspend_user' && report.target_type === 'user') {
-          await this.updateUserStatus(report.target_id, 'suspended', currentAdminId);
+          await this.updateUserStatus(report.target_id, 'suspended', currentAdminId, client);
         }
 
         await client.query(

@@ -106,35 +106,29 @@ export class MessageService {
 
     const isConnected = await checkPgConnection();
     if (isConnected) {
-      const existing = await pool.query(
-        `SELECT cm1.conversation_id
-         FROM conversation_members cm1
-         JOIN conversation_members cm2 ON cm1.conversation_id = cm2.conversation_id
-         JOIN conversations c ON c.id = cm1.conversation_id
-         WHERE cm1.user_id = $1 AND cm2.user_id = $2 AND c.is_group = FALSE
-         LIMIT 1`,
-        [userId, targetUserId]
-      );
+      return await withTransaction(async (client) => {
+        const [u1, u2] = [userId, targetUserId].sort();
 
-      if (existing.rows.length > 0) {
-        return existing.rows[0].conversation_id;
-      }
+        const existing = await client.query(
+          `SELECT cm1.conversation_id
+           FROM conversation_members cm1
+           JOIN conversation_members cm2 ON cm1.conversation_id = cm2.conversation_id
+           JOIN conversations c ON c.id = cm1.conversation_id
+           WHERE cm1.user_id = $1 AND cm2.user_id = $2 AND c.is_group = FALSE
+           LIMIT 1`,
+          [u1, u2]
+        );
 
-      const convId = generateId('conv');
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        await client.query(`INSERT INTO conversations (id) VALUES ($1)`, [convId]);
-        await client.query(`INSERT INTO conversation_members (id, conversation_id, user_id) VALUES ($1, $2, $3)`, [generateId('cmem'), convId, userId]);
-        await client.query(`INSERT INTO conversation_members (id, conversation_id, user_id) VALUES ($1, $2, $3)`, [generateId('cmem'), convId, targetUserId]);
-        await client.query('COMMIT');
+        if (existing.rows.length > 0) {
+          return existing.rows[0].conversation_id;
+        }
+
+        const convId = generateId('conv');
+        await client.query(`INSERT INTO conversations (id, is_group) VALUES ($1, FALSE)`, [convId]);
+        await client.query(`INSERT INTO conversation_members (id, conversation_id, user_id) VALUES ($1, $2, $3)`, [generateId('cmem'), convId, u1]);
+        await client.query(`INSERT INTO conversation_members (id, conversation_id, user_id) VALUES ($1, $2, $3)`, [generateId('cmem'), convId, u2]);
         return convId;
-      } catch (e) {
-        await client.query('ROLLBACK');
-        throw e;
-      } finally {
-        client.release();
-      }
+      });
     } else {
       await memoryStore.init();
       // Check existing 1-on-1 conversation

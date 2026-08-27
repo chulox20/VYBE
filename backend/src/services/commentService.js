@@ -205,11 +205,11 @@ export class CommentService {
     return roots;
   }
 
-  static async deleteComment(commentId, userId, isAdmin = false) {
+  static async deleteComment(commentId, userId, isAdmin = false, client = null) {
     const isConnected = await checkPgConnection();
     if (isConnected) {
-      return await withTransaction(async (client) => {
-        const check = await client.query('SELECT post_id, user_id FROM comments WHERE id = $1 FOR UPDATE', [commentId]);
+      const executeDelete = async (txClient) => {
+        const check = await txClient.query('SELECT post_id, user_id FROM comments WHERE id = $1 FOR UPDATE', [commentId]);
         if (check.rows.length === 0) {
           const err = new Error('Comentario no encontrado.');
           err.statusCode = 404;
@@ -225,16 +225,21 @@ export class CommentService {
         }
 
         // Delete comment (PostgreSQL cascades child replies via ON DELETE CASCADE)
-        await client.query('DELETE FROM comments WHERE id = $1', [commentId]);
+        await txClient.query('DELETE FROM comments WHERE id = $1', [commentId]);
 
         // Recalculate the entire comment_count for the post accurately to account for cascaded children
-        await client.query(
+        await txClient.query(
           'UPDATE posts SET comment_count = (SELECT COUNT(*)::int FROM comments WHERE post_id = $1) WHERE id = $1',
           [post_id]
         );
 
         return { success: true, message: 'Comentario eliminado correctamente.' };
-      });
+      };
+
+      if (client) {
+        return await executeDelete(client);
+      }
+      return await withTransaction(executeDelete);
     } else {
       await memoryStore.init();
       const idx = memoryStore.tables.comments.findIndex(c => c.id === commentId);

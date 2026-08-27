@@ -235,11 +235,11 @@ export class PostService {
     }
   }
 
-  static async deletePost(postId, userId, isAdmin = false) {
+  static async deletePost(postId, userId, isAdmin = false, client = null) {
     const isConnected = await checkPgConnection();
     if (isConnected) {
-      return await withTransaction(async (client) => {
-        const check = await client.query('SELECT user_id FROM posts WHERE id = $1', [postId]);
+      const executeDelete = async (txClient) => {
+        const check = await txClient.query('SELECT user_id FROM posts WHERE id = $1', [postId]);
         if (check.rows.length === 0) {
           const err = new Error('Publicación no encontrada.');
           err.statusCode = 404;
@@ -254,27 +254,32 @@ export class PostService {
         }
 
         // Get linked communities before deletion
-        const commPosts = await client.query('SELECT community_id FROM community_posts WHERE post_id = $1', [postId]);
+        const commPosts = await txClient.query('SELECT community_id FROM community_posts WHERE post_id = $1', [postId]);
 
         // Delete post
-        await client.query('DELETE FROM posts WHERE id = $1', [postId]);
+        await txClient.query('DELETE FROM posts WHERE id = $1', [postId]);
 
         // Recalculate user post count
-        await client.query(
+        await txClient.query(
           'UPDATE user_profiles SET post_count = (SELECT COUNT(*)::int FROM posts WHERE user_id = $1) WHERE user_id = $1',
           [authorId]
         );
 
         // Recalculate community post count if post belonged to communities
         for (const row of commPosts.rows) {
-          await client.query(
+          await txClient.query(
             'UPDATE communities SET post_count = (SELECT COUNT(*)::int FROM community_posts WHERE community_id = $1) WHERE id = $1',
             [row.community_id]
           );
         }
 
         return { success: true, message: 'Publicación eliminada correctamente.' };
-      });
+      };
+
+      if (client) {
+        return await executeDelete(client);
+      }
+      return await withTransaction(executeDelete);
     } else {
       await memoryStore.init();
       const idx = memoryStore.tables.posts.findIndex(p => p.id === postId);
