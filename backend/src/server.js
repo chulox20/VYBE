@@ -148,18 +148,21 @@ app.use(errorHandler);
 // Server startup
 async function startServer() {
   await checkPgConnection();
-  const PORT = env.PORT || 5000;
-  server.listen(PORT, () => {
-    console.log(`\n🟣 ==========================================`);
-    console.log(`🌐 VYBE API & Socket.IO Server running on port ${PORT}`);
-    console.log(`⚡ Environment: ${env.NODE_ENV}`);
-    console.log(`🟣 ==========================================\n`);
-  });
+  if (!process.env.VERCEL) {
+    const PORT = env.PORT || 5000;
+    server.listen(PORT, () => {
+      console.log(`\n🟣 ==========================================`);
+      console.log(`🌐 VYBE API & Socket.IO Server running on port ${PORT}`);
+      console.log(`⚡ Environment: ${env.NODE_ENV}`);
+      console.log(`🟣 ==========================================\n`);
+    });
 
-  setInterval(() => {}, 1000 * 60 * 60);
+    setInterval(() => {}, 1000 * 60 * 60);
+  }
 }
 
 startServer();
 
 export { app, server, io };
 export default app;
+
